@@ -103,17 +103,154 @@ cert_is_trusted(){
 }
 
 make_share_link(){
+    local host
+    host=$(bracket_host "$ip")
     if cert_is_trusted; then
-        shared_link="juicity://$uuid:$passwd@$ip:$port?congestion_control=bbr&sni=$hy_domain"
+        shared_link="juicity://$uuid:$passwd@$host:$port?congestion_control=bbr&sni=$hy_domain"
         return
     fi
 
     local pin
     pin=$(cert_pin_sha256)
     if [[ -n $pin ]]; then
-        shared_link="juicity://$uuid:$passwd@$ip:$port?allow_insecure=1&congestion_control=bbr&pinned_certchain_sha256=$pin&sni=$hy_domain"
+        shared_link="juicity://$uuid:$passwd@$host:$port?allow_insecure=1&congestion_control=bbr&pinned_certchain_sha256=$pin&sni=$hy_domain"
     else
-        shared_link="juicity://$uuid:$passwd@$ip:$port?allow_insecure=1&congestion_control=bbr&sni=$hy_domain"
+        shared_link="juicity://$uuid:$passwd@$host:$port?allow_insecure=1&congestion_control=bbr&sni=$hy_domain"
+    fi
+}
+
+bracket_host(){
+    case "$1" in
+        *:*) echo "[$1]" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# Non-public IPv4 per RFC1918/RFC6598 CGNAT(100.64/10)/RFC3927/loopback.
+is_private_v4(){
+    case "$1" in
+        10.*) return 0 ;;
+        192.168.*) return 0 ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+        169.254.*) return 0 ;;
+        127.*) return 0 ;;
+        100.6[4-9].*|100.7[0-9].*|100.8[0-9].*|100.9[0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 0 ;;
+        0.*|255.255.255.255) return 0 ;;
+    esac
+    return 1
+}
+
+# Classify IPv6 by RFC4291/4193 prefix: 2000::/3 global, fc00::/7 ULA, fe80::/10 link-local.
+classify_v6(){
+    local addr="${1,,}" head dec
+    [[ $addr == ::1 ]] && { echo loopback; return; }
+    head="${addr%%:*}"
+    [[ -z $head ]] && { echo other; return; }
+    printf -v dec '%d' "0x$head" 2>/dev/null || { echo other; return; }
+    if (( dec >= 0x2000 && dec <= 0x3fff )); then echo global
+    elif (( dec >= 0xfe80 && dec <= 0xfebf )); then echo linklocal
+    elif (( dec >= 0xfc00 && dec <= 0xfdff )); then echo ula
+    else echo other
+    fi
+}
+
+external_v4(){
+    local svc out
+    for svc in https://api.ipify.org https://ipv4.icanhazip.com https://v4.ident.me; do
+        out=$(curl -4 -fsS --max-time 4 "$svc" 2>/dev/null | tr -d '[:space:]')
+        if [[ $out =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && ! is_private_v4 "$out"; then
+            echo "$out"; return 0
+        fi
+    done
+    return 1
+}
+
+external_v6(){
+    local svc out
+    for svc in https://api6.ipify.org https://ipv6.icanhazip.com https://v6.ident.me; do
+        out=$(curl -6 -fsS --max-time 4 "$svc" 2>/dev/null | tr -d '[:space:]')
+        if [[ $out == *:* ]] && [[ $(classify_v6 "$out") == global ]]; then
+            echo "$out"; return 0
+        fi
+    done
+    return 1
+}
+
+collect_public_ips(){
+    PUBLIC_IPS=()
+    local addr have_v4="" have_v6=""
+    declare -A _seen=()
+
+    while read -r addr; do
+        [[ -z $addr ]] && continue
+        is_private_v4 "$addr" && continue
+        [[ -n ${_seen[$addr]:-} ]] && continue
+        _seen[$addr]=1; PUBLIC_IPS+=("$addr"); have_v4=1
+    done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+
+    while read -r addr; do
+        [[ -z $addr ]] && continue
+        [[ $(classify_v6 "$addr") == global ]] || continue
+        [[ -n ${_seen[$addr]:-} ]] && continue
+        _seen[$addr]=1; PUBLIC_IPS+=("$addr"); have_v6=1
+    done < <(ip -6 -o addr show scope global -deprecated -tentative -temporary 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+
+    if [[ -z $have_v4 ]]; then
+        if addr=$(external_v4); then
+            [[ -z ${_seen[$addr]:-} ]] && { _seen[$addr]=1; PUBLIC_IPS+=("$addr"); }
+        fi
+    fi
+    if [[ -z $have_v6 ]]; then
+        if addr=$(external_v6); then
+            [[ -z ${_seen[$addr]:-} ]] && { _seen[$addr]=1; PUBLIC_IPS+=("$addr"); }
+        fi
+    fi
+}
+
+# Sets global $ip (bare) for link generation only; port binding stays wildcard.
+select_public_ip(){
+    collect_public_ips
+
+    if [[ ${#PUBLIC_IPS[@]} -eq 0 ]]; then
+        realip
+        [[ -z $ip ]] && red "Could not determine any public IP address." && exit 1
+        yellow "Using detected address for share links: $ip"
+        return
+    fi
+
+    if [[ ${#PUBLIC_IPS[@]} -eq 1 ]]; then
+        ip="${PUBLIC_IPS[0]}"
+        yellow "Using public address for share links: $ip"
+        return
+    fi
+
+    green "Multiple public addresses detected. Choose one for the share links:"
+    echo ""
+    local idx kind
+    for idx in "${!PUBLIC_IPS[@]}"; do
+        if [[ ${PUBLIC_IPS[idx]} == *:* ]]; then kind="IPv6"; else kind="IPv4"; fi
+        echo -e " ${GREEN}$((idx+1)).${PLAIN} ${PUBLIC_IPS[idx]} ${YELLOW}($kind)${PLAIN}"
+    done
+    echo ""
+    local choice
+    while :; do
+        read -rp "Enter option [1-${#PUBLIC_IPS[@]}]: " choice
+        if [[ $choice =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#PUBLIC_IPS[@]} )); then
+            ip="${PUBLIC_IPS[$((choice-1))]}"
+            break
+        fi
+        yellow "Invalid choice; enter a number between 1 and ${#PUBLIC_IPS[@]}."
+    done
+    yellow "Selected address for share links: $ip"
+}
+
+make_tuic_share_link(){
+    local host
+    host=$(bracket_host "$ip")
+    if cert_is_trusted; then
+        tuic_link="tuic://$uuid:$passwd@$host:$port?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$hy_domain"
+    else
+        tuic_link="tuic://$uuid:$passwd@$host:$port?allow_insecure=1&congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$hy_domain"
     fi
 }
 
@@ -394,17 +531,19 @@ EOF
         red "Zuicity failed to start. Check: journalctl -u zuicity-server" && exit 1
     fi
 
-    realip
+    select_public_ip
     mkdir -p /root/zuicity
 
     make_share_link
+    make_tuic_share_link
     make_client_security_config
     echo "$shared_link" > /root/zuicity/url.txt
+    echo "$tuic_link" > /root/zuicity/url-tuic.txt
 
     cat > /root/zuicity/client.json <<EOF
 {
     "listen": "127.0.0.1:1080",
-    "server": "$ip:$port",
+    "server": "$(bracket_host "$ip"):$port",
     "uuid": "$uuid",
     "password": "$passwd",
     "sni": "$hy_domain",
@@ -490,6 +629,9 @@ showconf(){
     echo ""
     yellow "Zuicity share link (/root/zuicity/url.txt):"
     red "$(cat /root/zuicity/url.txt 2>/dev/null)"
+    echo ""
+    yellow "TUIC share link (/root/zuicity/url-tuic.txt):"
+    red "$(cat /root/zuicity/url-tuic.txt 2>/dev/null)"
     echo ""
 }
 
