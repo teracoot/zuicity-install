@@ -304,6 +304,16 @@ if [[ ! $(type -P openssl) ]]; then
     ${PACKAGE_UPDATE[int]} >/dev/null 2>&1
     ${PACKAGE_INSTALL[int]} openssl >/dev/null 2>&1
 fi
+# ss (iproute2) is used for port-in-use checks; its package name differs by
+# distro family (iproute2 on apt, iproute on yum), so resolve it from $int.
+if [[ ! $(type -P ss) ]]; then
+    ${PACKAGE_UPDATE[int]} >/dev/null 2>&1
+    if [[ $int -le 1 ]]; then
+        ${PACKAGE_INSTALL[int]} iproute2 >/dev/null 2>&1
+    else
+        ${PACKAGE_INSTALL[int]} iproute >/dev/null 2>&1
+    fi
+fi
 
 realip(){
     ip=$(curl -s4m8 ip.p3terx.com -k | sed -n 1p) || ip=$(curl -s6m8 ip.p3terx.com -k | sed -n 1p)
